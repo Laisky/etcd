@@ -84,6 +84,7 @@ type apply struct {
 	notifyc chan struct{}
 }
 
+// Raft 节点的基本结构，在 raftNodeConfig 内继承了 raft.Node 结构。
 type raftNode struct {
 	lg *zap.Logger
 
@@ -138,6 +139,9 @@ func newRaftNode(cfg raftNodeConfig) *raftNode {
 		stopped:    make(chan struct{}),
 		done:       make(chan struct{}),
 	}
+
+	// 设定定时器，这是最底层的定时器，
+	// raftNode.ticker -> raftNode.tick -> node.Tick
 	if r.heartbeat == 0 {
 		r.ticker = &time.Ticker{}
 	} else {
@@ -164,6 +168,7 @@ func (r *raftNode) start(rh *raftReadyHandler) {
 
 		for {
 			select {
+			// 每次循环时，判断定时器是否已被触发，然后调用 raftNode.tick()
 			case <-r.ticker.C:
 				r.tick()
 			case rd := <-r.Ready():

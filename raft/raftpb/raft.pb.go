@@ -257,6 +257,7 @@ func (m *Message) String() string            { return proto.CompactTextString(m)
 func (*Message) ProtoMessage()               {}
 func (*Message) Descriptor() ([]byte, []int) { return fileDescriptorRaft, []int{3} }
 
+// 需要持久化存储到 WAL 的状态，
 type HardState struct {
 	Term             uint64 `protobuf:"varint,1,opt,name=term" json:"term"`
 	Vote             uint64 `protobuf:"varint,2,opt,name=vote" json:"vote"`

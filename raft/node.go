@@ -131,6 +131,7 @@ type Node interface {
 	Campaign(ctx context.Context) error
 	// Propose proposes that data be appended to the log. Note that proposals can be lost without
 	// notice, therefore it is user's job to ensure proposal retries.
+	// 发起提案
 	Propose(ctx context.Context, data []byte) error
 	// ProposeConfChange proposes config change.
 	// At most one ConfChange can be in the process of going through consensus.
@@ -268,6 +269,7 @@ type node struct {
 	logger Logger
 }
 
+// 初始化 node（node:Node --> raftNode）
 func newNode() node {
 	return node{
 		propc:      make(chan msgWithResult),
@@ -298,6 +300,7 @@ func (n *node) Stop() {
 	<-n.done
 }
 
+// 启动 node
 func (n *node) run(r *raft) {
 	var propc chan msgWithResult
 	var readyc chan Ready
@@ -339,6 +342,17 @@ func (n *node) run(r *raft) {
 			lead = r.lead
 		}
 
+		// 处理所有的消息，包括
+		//
+		// * msgWithResult：收到的需要返回 result 的消息
+		// * pb.Message: 收到的消息
+		// * ConfChange：配置变更
+		// * tick：时钟
+		// * Ready：持久化处理完成
+		// * Advance：上一次 Ready 至今缓存的消息
+		// * Status: 查询当前状态
+
+		// r.Step 负责处理消息，raft 会根据身份不同，调用不同的后续 raft.step()
 		select {
 		// TODO: maybe buffer the config propose if there exists one (the way
 		// described in raft dissertation)
@@ -435,6 +449,7 @@ func (n *node) run(r *raft) {
 
 // Tick increments the internal logical clock for this Node. Election timeouts
 // and heartbeat timeouts are in units of ticks.
+// 会被 raftNode.tick() 调用，被调用后，往 n.tickc 放入数据
 func (n *node) Tick() {
 	select {
 	case n.tickc <- struct{}{}:

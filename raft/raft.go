@@ -131,10 +131,15 @@ type Config struct {
 	// candidate and start an election. ElectionTick must be greater than
 	// HeartbeatTick. We suggest ElectionTick = 10 * HeartbeatTick to avoid
 	// unnecessary leader switching.
+	// 时间以 Tick 为单位，
+	// 相当于 electionTimeout，建议设置为 HeartbeatTick 的 10 倍。
+	// 超过 ElectionTick 后，follower 就会转变为 candidate
 	ElectionTick int
+
 	// HeartbeatTick is the number of Node.Tick invocations that must pass between
 	// heartbeats. That is, a leader sends heartbeat messages to maintain its
 	// leadership every HeartbeatTick ticks.
+	// 心跳的间隔，leader 每隔 HeartbeatTick 发送一次心跳
 	HeartbeatTick int
 
 	// Storage is the storage for raft. raft generates entries and states to be
@@ -248,6 +253,7 @@ func (c *Config) validate() error {
 	return nil
 }
 
+// 基础的 raft 节点，作为参数传递给 node 运行
 type raft struct {
 	id uint64
 
@@ -298,10 +304,12 @@ type raft struct {
 	// or candidate.
 	// number of ticks since it reached last electionTimeout or received a
 	// valid message from current leader when it is a follower.
+	// election time 的计时器，达到 electionTimeout 就触发竞选
 	electionElapsed int
 
 	// number of ticks since it reached last heartbeatTimeout.
 	// only leader keeps heartbeatElapsed.
+	// heartbeat 的计时器，达到 heartbeatTimeout 时就应该触发心跳
 	heartbeatElapsed int
 
 	checkQuorum bool
@@ -312,9 +320,14 @@ type raft struct {
 	// randomizedElectionTimeout is a random number between
 	// [electiontimeout, 2 * electiontimeout - 1]. It gets reset
 	// when raft changes its state to follower or candidate.
+	// 随机选举超时，避免 candidate 陷入过长的竞选。
+	// 通过随机的 electionTimeout，candidate 会交错的发起竞选，
+	// 而最早发起竞选的那个 candidate 最有可能竞选成功，可以极大的缩短选举耗时。
 	randomizedElectionTimeout int
 	disableProposalForwarding bool
 
+	// 会被 node 不断调用的计时器，
+	// 根据身份不同，有不同的实现，对于 follower 是 tickElection，对于 leader 是 tickHeartbeat
 	tick func()
 	step stepFunc
 
@@ -837,8 +850,12 @@ func (r *raft) Step(m pb.Message) error {
 	switch {
 	case m.Term == 0:
 		// local message
+	// 消息的 term 大于本地的 term
 	case m.Term > r.Term:
+		// 请求投票的消息
 		if m.Type == pb.MsgVote || m.Type == pb.MsgPreVote {
+			// force 指的是这个 candidate 是通过 leader transfer 而来的，可以强行发动竞选（忽略租约）。
+			// inLease 是指 follower 会检查租约是否过期，如果没有过期，且不是 force，则忽略投票请求（防止离群节点的干扰）。
 			force := bytes.Equal(m.Context, []byte(campaignTransfer))
 			inLease := r.checkQuorum && r.lead != None && r.electionElapsed < r.electionTimeout
 			if !force && inLease {
@@ -849,9 +866,13 @@ func (r *raft) Step(m pb.Message) error {
 				return nil
 			}
 		}
+
 		switch {
+		// 对于 PreVote，不需要更新自己的 term
+		// ❓TODO: 为啥不用更新自己的 term？因为发起 PerVote 的 node 也没有事先更新自己的 term，所以应该是可信的啊…
 		case m.Type == pb.MsgPreVote:
 			// Never change our term in response to a PreVote
+		// 穿越时空的 case，收到了一个 term 比当前还大的 PreVoteResp，一般来说是应该是不可能的…
 		case m.Type == pb.MsgPreVoteResp && !m.Reject:
 			// We send pre-vote requests with a term in our future. If the
 			// pre-vote is granted, we will increment our term when we get a
@@ -861,9 +882,12 @@ func (r *raft) Step(m pb.Message) error {
 		default:
 			r.logger.Infof("%x [term: %d] received a %s message with higher term from %x [term: %d]",
 				r.id, r.Term, m.Type, m.From, m.Term)
+
 			if m.Type == pb.MsgApp || m.Type == pb.MsgHeartbeat || m.Type == pb.MsgSnap {
+				// 已经有其他节点成为了 leader，并且发来了 term 更高的 msg／heartbeat
 				r.becomeFollower(m.Term, m.From)
 			} else {
+				// 只是因为收到了其他节点的高 term 消息（应该是 RequestVote），那么应该更新自己的 term，并且退为 follower
 				r.becomeFollower(m.Term, None)
 			}
 		}
@@ -968,6 +992,10 @@ func (r *raft) Step(m pb.Message) error {
 		}
 
 	default:
+		// 根据身份不同，有不同的实现
+		// * r.stepLeader()
+		// * r.stepFollower()
+		// * r.stepCandidate()
 		err := r.step(r, m)
 		if err != nil {
 			return err
