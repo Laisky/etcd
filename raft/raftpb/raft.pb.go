@@ -78,6 +78,7 @@ func (EntryType) EnumDescriptor() ([]byte, []int) { return fileDescriptorRaft, [
 type MessageType int32
 
 const (
+	// 选举类消息: Hub -> PreVote -> PreVoteResp -> Vote -> VoteResp
 	MsgHup            MessageType = 0
 	MsgBeat           MessageType = 1
 	MsgProp           MessageType = 2
@@ -85,7 +86,7 @@ const (
 	MsgAppResp        MessageType = 4
 	MsgVote           MessageType = 5
 	MsgVoteResp       MessageType = 6
-	MsgSnap           MessageType = 7
+	MsgSnap           MessageType = 7 // snapshot
 	MsgHeartbeat      MessageType = 8
 	MsgHeartbeatResp  MessageType = 9
 	MsgUnreachable    MessageType = 10

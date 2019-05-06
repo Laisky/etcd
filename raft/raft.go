@@ -685,6 +685,7 @@ func (r *raft) tickElection() {
 	r.electionElapsed++
 
 	if r.promotable() && r.pastElectionTimeout() {
+		// 如果 electionTimeout，则触发一个 MsgHup 到 Step
 		r.electionElapsed = 0
 		r.Step(pb.Message{From: r.id, Type: pb.MsgHup})
 	}
@@ -790,12 +791,16 @@ func (r *raft) becomeLeader() {
 	r.logger.Infof("%x became leader at term %d", r.id, r.Term)
 }
 
+// 发起竞选
+// t 可以为 campaignElection/campaignPreElection
 func (r *raft) campaign(t CampaignType) {
 	var term uint64
 	var voteMsg pb.MessageType
 	if t == campaignPreElection {
 		r.becomePreCandidate()
 		voteMsg = pb.MsgPreVote
+		// 这里需要注意的是，PreVote 会针对“下一轮 term”发起投票，
+		// 而 Vote 则是针对当前 term
 		// PreVote RPCs are sent for the next term before we've incremented r.Term.
 		term = r.Term + 1
 	} else {
@@ -803,6 +808,8 @@ func (r *raft) campaign(t CampaignType) {
 		voteMsg = pb.MsgVote
 		term = r.Term
 	}
+
+	// 自己投自己胜出，说明该集群只有一个节点…
 	if r.quorum() == r.poll(r.id, voteRespMsgType(voteMsg), true) {
 		// We won the election after voting for ourselves (which must mean that
 		// this is a single-node cluster). Advance to the next state.
@@ -813,6 +820,8 @@ func (r *raft) campaign(t CampaignType) {
 		}
 		return
 	}
+
+	// 遍历所有的 peers，发送投票请求
 	for id := range r.prs {
 		if id == r.id {
 			continue
@@ -824,6 +833,8 @@ func (r *raft) campaign(t CampaignType) {
 		if t == campaignTransfer {
 			ctx = []byte(t)
 		}
+
+		// 发送投票请求
 		r.send(pb.Message{Term: term, To: id, Type: voteMsg, Index: r.raftLog.lastIndex(), LogTerm: r.raftLog.lastTerm(), Context: ctx})
 	}
 }
@@ -845,12 +856,15 @@ func (r *raft) poll(id uint64, t pb.MessageType, v bool) (granted int) {
 	return granted
 }
 
+// 该函数是对消息的一些通用处理逻辑，通用指的就是不考虑节点的状态。
+// 在通用处理逻辑最后，会调用 r.step，这会进入不同状态的专属处理逻辑之中。
 func (r *raft) Step(m pb.Message) error {
 	// Handle the message term, which may result in our stepping down to a follower.
 	switch {
 	case m.Term == 0:
 		// local message
 	// 消息的 term 大于本地的 term
+	// 出了 PreVote 和 PreVoteResp 外，自己都应该降为 Follower 并更新 term
 	case m.Term > r.Term:
 		// 请求投票的消息
 		if m.Type == pb.MsgVote || m.Type == pb.MsgPreVote {
@@ -872,7 +886,7 @@ func (r *raft) Step(m pb.Message) error {
 		// ❓TODO: 为啥不用更新自己的 term？因为发起 PerVote 的 node 也没有事先更新自己的 term，所以应该是可信的啊…
 		case m.Type == pb.MsgPreVote:
 			// Never change our term in response to a PreVote
-		// 穿越时空的 case，收到了一个 term 比当前还大的 PreVoteResp，一般来说是应该是不可能的…
+		// 收到了 term 更大的 PreVoteResp，说明自己之前发起的 PreVote 被同意了
 		case m.Type == pb.MsgPreVoteResp && !m.Reject:
 			// We send pre-vote requests with a term in our future. If the
 			// pre-vote is granted, we will increment our term when we get a
@@ -892,6 +906,10 @@ func (r *raft) Step(m pb.Message) error {
 			}
 		}
 
+	// 消息的 term 小于当前的 term
+	// 如果消息来自于 leader，直接答复会导致 leader 退位，所以需要先确保自己不是因为网络隔离导致 term 偏大（是否开启了 prevote 机制）。
+	// 如果消息是 PreVote（说明肯定开启了 PreVote），直接答复，告知对方不要在竞选了。
+	// 对于其他消息，直接无视。
 	case m.Term < r.Term:
 		if (r.checkQuorum || r.preVote) && (m.Type == pb.MsgHeartbeat || m.Type == pb.MsgApp) {
 			// We have received messages from a leader at a lower term. It is possible
@@ -915,6 +933,9 @@ func (r *raft) Step(m pb.Message) error {
 			// with "pb.MsgAppResp" of higher term would force leader to step down.
 			// However, this disruption is inevitable to free this stuck node with
 			// fresh election. This can be prevented with Pre-Vote phase.
+
+			// 如果启用了 checkQuorum 或 preVote，那么就不用担心分区导致的干扰，那么就直接返回应答。
+			// 因为当前节点的 term 更大，所以应答会直接导致对方 leader 退位。
 			r.send(pb.Message{To: m.From, Type: pb.MsgAppResp})
 		} else if m.Type == pb.MsgPreVote {
 			// Before Pre-Vote enable, there may have candidate with higher term,
@@ -922,6 +943,7 @@ func (r *raft) Step(m pb.Message) error {
 			// we drop messages with a lower term.
 			r.logger.Infof("%x [logterm: %d, index: %d, vote: %x] rejected %s from %x [logterm: %d, index: %d] at term %d",
 				r.id, r.raftLog.lastTerm(), r.raftLog.lastIndex(), r.Vote, m.Type, m.From, m.LogTerm, m.Index, r.Term)
+			// 拒绝 PreVote，因为自己的 term 更大
 			r.send(pb.Message{To: m.From, Term: r.Term, Type: pb.MsgPreVoteResp, Reject: true})
 		} else {
 			// ignore other cases
@@ -932,17 +954,21 @@ func (r *raft) Step(m pb.Message) error {
 	}
 
 	switch m.Type {
-	case pb.MsgHup:
+	case pb.MsgHup: // electionTimeout 时，自行调用 r.Step(pb.MsgHup)
+		// 选举超时，如果自己已经是 leader，则忽略。
+		// 如果自己不是 leader，要求所有 committed 的 entry 都已经 applied，才能参与竞选。
 		if r.state != StateLeader {
 			ents, err := r.raftLog.slice(r.raftLog.applied+1, r.raftLog.committed+1, noLimit)
 			if err != nil {
 				r.logger.Panicf("unexpected error getting unapplied entries (%v)", err)
 			}
 			if n := numOfPendingConf(ents); n != 0 && r.raftLog.committed > r.raftLog.applied {
+				// 因为还有 entries 没有 apply 到 RSM，所以放弃本轮竞选，等待同步后再竞选
 				r.logger.Warningf("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
 				return nil
 			}
 
+			// 参与竞选
 			r.logger.Infof("%x is starting a new election at term %d", r.id, r.Term)
 			if r.preVote {
 				r.campaign(campaignPreElection)
@@ -954,12 +980,16 @@ func (r *raft) Step(m pb.Message) error {
 		}
 
 	case pb.MsgVote, pb.MsgPreVote:
+		// 收到投票的邀请
 		if r.isLearner {
+			// leaner 不参与投票
+			// ❓TODO：下面这个 TODO 有些奇怪，因为 learner 理论上并不属于集群成员。
 			// TODO: learner may need to vote, in case of node down when confchange.
 			r.logger.Infof("%x [logterm: %d, index: %d, vote: %x] ignored %s from %x [logterm: %d, index: %d] at term %d: learner can not vote",
 				r.id, r.raftLog.lastTerm(), r.raftLog.lastIndex(), r.Vote, m.Type, m.From, m.LogTerm, m.Index, r.Term)
 			return nil
 		}
+		// 检查自己是否已经投过票了，如果投票请求来自同一节点，可以重复投票。
 		// We can vote if this is a repeat of a vote we've already cast...
 		canVote := r.Vote == m.From ||
 			// ...we haven't voted and we don't think there's a leader yet in this term...
@@ -970,6 +1000,8 @@ func (r *raft) Step(m pb.Message) error {
 		if canVote && r.raftLog.isUpToDate(m.Index, m.LogTerm) {
 			r.logger.Infof("%x [logterm: %d, index: %d, vote: %x] cast %s for %x [logterm: %d, index: %d] at term %d",
 				r.id, r.raftLog.lastTerm(), r.raftLog.lastIndex(), r.Vote, m.Type, m.From, m.LogTerm, m.Index, r.Term)
+			// 经过检查，同意投票
+			// 需要注意的是，返回的 term 是消息中的 term，而不是该节点的 term
 			// When responding to Msg{Pre,}Vote messages we include the term
 			// from the message, not the local term. To see why, consider the
 			// case where a single node was previously partitioned away and
@@ -986,6 +1018,7 @@ func (r *raft) Step(m pb.Message) error {
 				r.Vote = m.From
 			}
 		} else {
+			// 拒绝投票
 			r.logger.Infof("%x [logterm: %d, index: %d, vote: %x] rejected %s from %x [logterm: %d, index: %d] at term %d",
 				r.id, r.raftLog.lastTerm(), r.raftLog.lastIndex(), r.Vote, m.Type, m.From, m.LogTerm, m.Index, r.Term)
 			r.send(pb.Message{To: m.From, Term: r.Term, Type: voteRespMsgType(m.Type), Reject: true})
@@ -1006,6 +1039,7 @@ func (r *raft) Step(m pb.Message) error {
 
 type stepFunc func(r *raft, m pb.Message) error
 
+// leader 的消息处理函数。
 func stepLeader(r *raft, m pb.Message) error {
 	// These message types do not require any progress for m.From.
 	switch m.Type {
@@ -1138,6 +1172,7 @@ func stepLeader(r *raft, m pb.Message) error {
 				for r.maybeSendAppend(m.From, false) {
 				}
 				// Transfer leadership is in progress.
+				// 禅让节点日志同步完成，发送 TimeoutNowRPC 触发竞选
 				if m.From == r.leadTransferee && pr.Match == r.raftLog.lastIndex() {
 					r.logger.Infof("%x sent MsgTimeoutNow to %x after received MsgAppResp", r.id, m.From)
 					r.sendTimeoutNow(m.From)
@@ -1197,32 +1232,42 @@ func stepLeader(r *raft, m pb.Message) error {
 			pr.becomeProbe()
 		}
 		r.logger.Debugf("%x failed to send message to %x because it is unreachable [%s]", r.id, m.From, pr)
-	case pb.MsgTransferLeader:
+	case pb.MsgTransferLeader: // 禅让
 		if pr.IsLearner {
+			// 不能交权给 learner
 			r.logger.Debugf("%x is learner. Ignored transferring leadership", r.id)
 			return nil
 		}
+
 		leadTransferee := m.From
 		lastLeadTransferee := r.leadTransferee
 		if lastLeadTransferee != None {
+			// 有禅让正在进行中
 			if lastLeadTransferee == leadTransferee {
+				// 禅让目标一致，直接忽略
 				r.logger.Infof("%x [term %d] transfer leadership to %x is in progress, ignores request to same node %x",
 					r.id, r.Term, leadTransferee, leadTransferee)
 				return nil
 			}
+			// 禅让目标不一致，中断正在进行的禅让，响应新的请求
 			r.abortLeaderTransfer()
 			r.logger.Infof("%x [term %d] abort previous transferring leadership to %x", r.id, r.Term, lastLeadTransferee)
 		}
+
 		if leadTransferee == r.id {
+			// 禅让目标是自己，忽略
 			r.logger.Debugf("%x is already leader. Ignored transferring leadership to self", r.id)
 			return nil
 		}
+
 		// Transfer leadership to third party.
 		r.logger.Infof("%x [term %d] starts to transfer leadership to %x", r.id, r.Term, leadTransferee)
 		// Transfer leadership should be finished in one electionTimeout, so reset r.electionElapsed.
 		r.electionElapsed = 0
 		r.leadTransferee = leadTransferee
 		if pr.Match == r.raftLog.lastIndex() {
+			// 检查 transferee 的日志是否跟上了进度
+			// 如果日志已经是最新的，通过 MsgTimeoutNow 触发立刻选举
 			r.sendTimeoutNow(leadTransferee)
 			r.logger.Infof("%x sends MsgTimeoutNow to %x immediately as %x already has up-to-date log", r.id, leadTransferee, leadTransferee)
 		} else {
@@ -1232,6 +1277,7 @@ func stepLeader(r *raft, m pb.Message) error {
 	return nil
 }
 
+// candidate 的消息处理函数。
 // stepCandidate is shared by StateCandidate and StatePreCandidate; the difference is
 // whether they respond to MsgVoteResp or MsgPreVoteResp.
 func stepCandidate(r *raft, m pb.Message) error {
@@ -1258,17 +1304,21 @@ func stepCandidate(r *raft, m pb.Message) error {
 		r.becomeFollower(m.Term, m.From) // always m.Term == r.Term
 		r.handleSnapshot(m)
 	case myVoteRespType:
+		// 加上自己的选票
 		gr := r.poll(m.From, m.Type, !m.Reject)
 		r.logger.Infof("%x [quorum:%d] has received %d %s votes and %d vote rejections", r.id, r.quorum(), gr, m.Type, len(r.votes)-gr)
 		switch r.quorum() {
-		case gr:
+		case gr: // 竞选成功
 			if r.state == StatePreCandidate {
+				// PreVote 成功，发起 RequestVote
 				r.campaign(campaignElection)
 			} else {
+				// 已经是 Vote 阶段，直接成为 leader
+				// 成为 leader 后，立刻发起一轮 no-op 的广播
 				r.becomeLeader()
 				r.bcastAppend()
 			}
-		case len(r.votes) - gr:
+		case len(r.votes) - gr: // 竞选失败
 			// pb.MsgPreVoteResp contains future term of pre-candidate
 			// m.Term > r.Term; reuse r.Term
 			r.becomeFollower(r.Term, None)
@@ -1279,6 +1329,7 @@ func stepCandidate(r *raft, m pb.Message) error {
 	return nil
 }
 
+// follower 的消息处理函数
 func stepFollower(r *raft, m pb.Message) error {
 	switch m.Type {
 	case pb.MsgProp:
