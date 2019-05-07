@@ -370,7 +370,7 @@ func (n *node) run(r *raft) {
 			if pr := r.getProgress(m.From); pr != nil || !IsResponseMsg(m.Type) {
 				r.Step(m)
 			}
-		case cc := <-n.confc:
+		case cc := <-n.confc: // 配置变更
 			if cc.NodeID == None {
 				select {
 				case n.confstatec <- pb.ConfState{

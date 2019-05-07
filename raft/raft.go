@@ -862,6 +862,7 @@ func (r *raft) Step(m pb.Message) error {
 	// Handle the message term, which may result in our stepping down to a follower.
 	switch {
 	case m.Term == 0:
+		// term == 0，表明这个消息是由本机自己生成的
 		// local message
 	// 消息的 term 大于本地的 term
 	// 出了 PreVote 和 PreVoteResp 外，自己都应该降为 Follower 并更新 term
@@ -1087,6 +1088,8 @@ func stepLeader(r *raft, m pb.Message) error {
 	case pb.MsgReadIndex:
 		if r.quorum() > 1 {
 			if r.raftLog.zeroTermOnErrCompacted(r.raftLog.term(r.raftLog.committed)) != r.Term {
+				// ❓TODO：直接拒绝？因为 becomeLeader 后会立刻发起一轮 no-op，
+				// 所以此时应该是 no-op 尚未完成？所以直接返回 nil，然后让客户端重试。
 				// Reject read only request when this leader has not committed any log entry at its term.
 				return nil
 			}
@@ -1096,9 +1099,11 @@ func stepLeader(r *raft, m pb.Message) error {
 			// This would allow multiple reads to piggyback on the same message.
 			switch r.readOnly.option {
 			case ReadOnlySafe:
+				// 对每一个 readonly 请求都逐一的发起 heartbeat，确保返回的消息是最新的
 				r.readOnly.addRequest(r.raftLog.committed, m)
 				r.bcastHeartbeatWithCtx(m.Entries[0].Data)
 			case ReadOnlyLeaseBased:
+				// 基于租约的批处理优化
 				ri := r.raftLog.committed
 				if m.From == None || m.From == r.id { // from local member
 					r.readStates = append(r.readStates, ReadState{Index: r.raftLog.committed, RequestCtx: m.Entries[0].Data})
@@ -1123,6 +1128,7 @@ func stepLeader(r *raft, m pb.Message) error {
 		r.logger.Debugf("%x no progress available for %x", r.id, m.From)
 		return nil
 	}
+
 	switch m.Type {
 	case pb.MsgAppResp:
 		pr.RecentActive = true
